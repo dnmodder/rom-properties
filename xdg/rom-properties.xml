@@ -603,6 +603,15 @@
     </magic>
   </mime-type>
 
+  <!-- Wii U WUA (ZArchive) -->
+  <mime-type type="application/x-wua-rom">
+    <comment>Wii U WUA archive</comment>
+    <sub-class-of type="application/x-cd-image"/>
+    <generic-icon name="application-x-cd-image"/>
+    <alias type="application/x-wii-u-wua"/>
+    <glob pattern="*.wua" weight="70"/>
+  </mime-type>
+
   <!-- WiiUAncast -->
   <mime-type type="application/x-wii-u-firmware-image">
     <comment>Wii U firmware image</comment>
