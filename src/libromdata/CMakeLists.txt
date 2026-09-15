@@ -460,8 +460,17 @@ ENDIF(NOT ${PROJECT_NAME}_NETWORKING_SRCS)
 
 # Files that require ZSTD.
 IF(HAVE_ZSTD)
-	SET(${PROJECT_NAME}_ZSTD_SRCS disc/Z3DSReader.cpp)
-	SET(${PROJECT_NAME}_ZSTD_H    disc/Z3DSReader.hpp)
+	SET(${PROJECT_NAME}_ZSTD_SRCS
+		disc/Z3DSReader.cpp
+		disc/ZArchiveFile.cpp
+		disc/ZArchiveReader.cpp
+		)
+	SET(${PROJECT_NAME}_ZSTD_H
+		disc/Z3DSReader.hpp
+		disc/ZArchiveFile.hpp
+		disc/ZArchiveReader.hpp
+		disc/zarchive_structs.h
+		)
 ENDIF(HAVE_ZSTD)
 
 # dlopen() notes
