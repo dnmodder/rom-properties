@@ -78,9 +78,9 @@ int WiiUPackagePrivate::loadSystemXml(xml_document &doc, const char *filename, c
 	}
 
 	// Read the entire resource into memory.
-	// Assuming a limit of 64 KB for Wii U system XML files.
+	// Assuming a limit of 1 MB for Wii U system XML files.
 	const size_t xml_size = static_cast<size_t>(f_xml->size());
-	if (xml_size > 65536) {
+	if (xml_size > 1024 * 1024) {
 		// Manifest is too big.
 		// (Or, it's negative, and wraps around due to unsigned.)
 		return -ENOMEM;
@@ -414,6 +414,30 @@ int WiiUPackagePrivate::addFields_System_XMLs(void)
 	// Product code
 	ADD_TEXT(metaRootNode, "product_code", C_("Nintendo", "Product Code"));
 
+	if (!ticket && !tmd) {
+		uint64_t title_id = parseHexBinary(metaRootNode, "title_id");
+		if (title_id == 0 && appRootNode) {
+			title_id = parseHexBinary(appRootNode, "title_id");
+		}
+		if (title_id != 0) {
+			fields.addField_string(C_("Nintendo", "Title ID"),
+				fmt::format(FSTR("{:0>8X}-{:0>8X}"),
+					static_cast<uint32_t>(title_id >> 32),
+					static_cast<uint32_t>(title_id & 0xFFFFFFFFU)),
+				RomFields::STRF_MONOSPACE);
+		}
+
+		unsigned int title_version = parseUnsignedInt(metaRootNode, "title_version", ~0U);
+		if (title_version == ~0U && appRootNode) {
+			title_version = parseUnsignedInt(appRootNode, "title_version", ~0U);
+		}
+		if (title_version != ~0U) {
+			fields.addField_string(C_("RomData", "Title Version"),
+				fmt::format(FSTR("{:d}.{:d} (v{:d})"),
+					title_version >> 8, title_version & 0xFF, title_version));
+		}
+	}
+
 	// SDK version
 	if (appRootNode) {
 		const unsigned int sdk_version = parseUnsignedInt(appRootNode, "sdk_version");
@@ -621,13 +645,27 @@ int WiiUPackagePrivate::addMetaData_System_XMLs(void)
 	// SDK version (as OS Version)
 	xml_document appXml;
 	ret = loadSystemXml(appXml, "/code/app.xml", "app");
+	xml_node appRootNode;
 	if (ret == 0) {
-		xml_node appRootNode = appXml.child("app");
+		appRootNode = appXml.child("app");
 		if (appRootNode) {
 			const unsigned int sdk_version = parseUnsignedInt(appRootNode, "sdk_version");
 			if (sdk_version != 0) {
 				metaData.addMetaData_string(Property::OSVersion, formatSdkVersion(sdk_version));
 			}
+		}
+	}
+
+	if (!ticket) {
+		uint64_t title_id = parseHexBinary(metaRootNode, "title_id");
+		if (title_id == 0 && appRootNode) {
+			title_id = parseHexBinary(appRootNode, "title_id");
+		}
+		if (title_id != 0) {
+			metaData.addMetaData_string(Property::TitleID,
+				fmt::format(FSTR("{:0>8X}-{:0>8X}"),
+					static_cast<uint32_t>(title_id >> 32),
+					static_cast<uint32_t>(title_id & 0xFFFFFFFFU)));
 		}
 	}
 

@@ -18,6 +18,9 @@
 
 // Wii U FST
 #include "disc/WiiUFst.hpp"
+#ifdef HAVE_ZSTD
+#  include "disc/ZArchiveReader.hpp"
+#endif /* HAVE_ZSTD */
 
 // librpbase
 #include "librpbase/disc/IDiscReader.hpp"
@@ -40,6 +43,7 @@
 
 // C++ STL includes
 #include <memory>
+#include <string>
 #include <vector>
 
 // PugiXML
@@ -53,9 +57,10 @@ namespace LibRomData {
 class WiiUPackagePrivate final : public LibRpBase::RomDataPrivate
 {
 public:
-	WiiUPackagePrivate(const char *path);
+	explicit WiiUPackagePrivate(const LibRpFile::IRpFilePtr &file);
+	explicit WiiUPackagePrivate(const char *path);
 #if defined(_WIN32) && defined(_UNICODE)
-	WiiUPackagePrivate(const wchar_t *path);
+	explicit WiiUPackagePrivate(const wchar_t *path);
 #endif /* _WIN32 && _UNICODE */
 
 private:
@@ -65,8 +70,8 @@ public:
 
 public:
 	/** RomDataInfo **/
-	static const std::array<const char*, 0+1> exts;
-	static const std::array<const char*, 1+1> mimeTypes;
+	static const std::array<const char*, 1+1> exts;
+	static const std::array<const char*, 2+1> mimeTypes;
 	static const LibRpBase::RomDataInfo romDataInfo;
 
 public:
@@ -76,6 +81,7 @@ public:
 
 		NUS		= 0,	// NUS format
 		Extracted	= 1,	// Extracted
+		WUA		= 2,	// WUA (ZArchive) format
 
 		Max
 	};
@@ -83,6 +89,20 @@ public:
 
 	// Directory path
 	std::tstring path;
+
+#ifdef HAVE_ZSTD
+	ZArchiveReaderPtr zarReader;
+#endif /* HAVE_ZSTD */
+	std::string subPath;
+
+	struct ContainedTitle {
+		uint64_t titleId;
+		uint16_t version;
+		std::string dirName;
+		std::string titleName;
+		uint32_t appType;
+	};
+	std::vector<ContainedTitle> containedTitles;
 
 	// Ticket, TMD, and FST
 	std::unique_ptr<WiiTicket> ticket;

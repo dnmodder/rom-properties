@@ -46,12 +46,15 @@ ROMDATA_IMPL(WiiUPackage)
 /** WiiUPackagePrivate **/
 
 /* RomDataInfo */
-const array<const char*, 0+1> WiiUPackagePrivate::exts = {{
-	// No file extensions; NUS packages are directories.
+const array<const char*, 1+1> WiiUPackagePrivate::exts = {{
+	".wua",
+
 	nullptr
 }};
-const array<const char*, 1+1> WiiUPackagePrivate::mimeTypes = {{
-	// NUS packages are directories.
+const array<const char*, 2+1> WiiUPackagePrivate::mimeTypes = {{
+	"application/x-wua-rom",
+
+	// NUS packages and extracted packages are directories.
 	"inode/directory",
 
 	nullptr
@@ -59,6 +62,16 @@ const array<const char*, 1+1> WiiUPackagePrivate::mimeTypes = {{
 const RomDataInfo WiiUPackagePrivate::romDataInfo = {
 	"WiiUPackage", exts.data(), mimeTypes.data()
 };
+
+WiiUPackagePrivate::WiiUPackagePrivate(const IRpFilePtr &file)
+	: super(file, &romDataInfo)
+	, packageType(PackageType::Unknown)
+{
+#ifdef ENABLE_DECRYPTION
+	// Clear the title key.
+	memset(title_key, 0, sizeof(title_key));
+#endif /* ENABLE_DECRYPTION */
+}
 
 WiiUPackagePrivate::WiiUPackagePrivate(const char *path)
 	: super({}, &romDataInfo)
@@ -101,6 +114,11 @@ WiiUPackagePrivate::WiiUPackagePrivate(const wchar_t *path)
 void WiiUPackagePrivate::reset(void)
 {
 	path.clear();
+#ifdef HAVE_ZSTD
+	zarReader.reset();
+	subPath.clear();
+	containedTitles.clear();
+#endif /* HAVE_ZSTD */
 
 	ticket.reset();
 	tmd.reset();
@@ -196,6 +214,27 @@ IRpFilePtr WiiUPackagePrivate::open(const char *filename)
 	if (!filename || filename[0] == '\0') {
 		return {};
 	}
+
+#ifdef HAVE_ZSTD
+	if (packageType == PackageType::WUA) {
+		if (!zarReader) {
+			return {};
+		}
+		while (*filename == '/') {
+			filename++;
+		}
+		if (*filename == '\0') {
+			return {};
+		}
+		string s_full_filename;
+		if (!subPath.empty()) {
+			s_full_filename = subPath;
+			s_full_filename += '/';
+		}
+		s_full_filename += filename;
+		return zarReader->openFile(s_full_filename.c_str());
+	}
+#endif /* HAVE_ZSTD */
 
 	if (packageType == PackageType::Extracted) {
 		// Extracted package format. Open the file directly.
@@ -315,11 +354,69 @@ rp_image_const_ptr WiiUPackagePrivate::loadIcon(void)
  *
  * @param file Open ROM image.
  */
-WiiUPackage::WiiUPackage(const IRpFilePtr &file)
-	: super(new WiiUPackagePrivate((const TCHAR*)nullptr))
+#ifdef HAVE_ZSTD
+/**
+ * Parse a WUA title folder name (<16-hex-digit-titleId>_v<decimal-version>).
+ * @param name Directory name
+ * @param titleIdOut Output Title ID
+ * @param versionOut Output version
+ * @return True on success; false on failure.
+ */
+static bool parseWuaTitleFolderName(const string &name, uint64_t &titleIdOut, uint16_t &versionOut)
 {
-	// Not supported!
-	RP_UNUSED(file);
+	if (name.size() < 16 + 2) {
+		return false;
+	}
+	uint64_t titleId = 0;
+	for (size_t i = 0; i < 16; i++) {
+		char c = name[i];
+		uint8_t nibble;
+		if (c >= '0' && c <= '9') {
+			nibble = c - '0';
+		} else if (c >= 'a' && c <= 'f') {
+			nibble = c - 'a' + 10;
+		} else if (c >= 'A' && c <= 'F') {
+			nibble = c - 'A' + 10;
+		} else {
+			return false;
+		}
+		titleId = (titleId << 4) | nibble;
+	}
+	if (name[16] != '_' || (name[17] != 'v' && name[17] != 'V')) {
+		return false;
+	}
+	const char *p = &name[18];
+	if (*p == '\0') {
+		return false;
+	}
+	char *endptr = nullptr;
+	unsigned long v = strtoul(p, &endptr, 10);
+	if (!endptr || *endptr != '\0' || v > 65535) {
+		return false;
+	}
+	titleIdOut = titleId;
+	versionOut = static_cast<uint16_t>(v);
+	return true;
+}
+#endif /* HAVE_ZSTD */
+
+/**
+ * Read a Wii U NUS package or WUA archive.
+ *
+ * A ROM image must be opened by the caller. The file handle
+ * will be ref()'d and must be kept open in order to load
+ * data from the ROM image.
+ *
+ * To close the file, either delete this object or call close().
+ *
+ * NOTE: Check isValid() to determine if this is a valid ROM.
+ *
+ * @param file Open ROM image.
+ */
+WiiUPackage::WiiUPackage(const IRpFilePtr &file)
+	: super(new WiiUPackagePrivate(file))
+{
+	init();
 }
 
 /**
@@ -357,13 +454,75 @@ WiiUPackage::WiiUPackage(const wchar_t *path)
 #endif /* _WIN32 && _UNICODE */
 
 /**
- * Internal initialization function for the two constructors.
+ * Internal initialization function for the constructors.
  */
 void WiiUPackage::init(void)
 {
 	RP_D(WiiUPackage);
 	d->mimeType = "inode/directory";
 	d->fileType = FileType::ApplicationPackage;
+
+#ifdef HAVE_ZSTD
+	if (d->file) {
+		d->mimeType = "application/x-wua-rom";
+		d->packageType = WiiUPackagePrivate::PackageType::WUA;
+		d->zarReader = std::make_shared<ZArchiveReader>(d->file);
+		if (!d->zarReader->isOpen()) {
+			d->reset();
+			return;
+		}
+
+		// Enumerate root to find title subdirectories
+		uint32_t rootNode = 0;
+		uint32_t entryCount = d->zarReader->getDirEntryCount(rootNode);
+		int primaryIdx = -1;
+
+		for (uint32_t i = 0; i < entryCount; i++) {
+			string name;
+			bool isFile = false;
+			uint64_t size = 0;
+			if (!d->zarReader->getDirEntry(rootNode, i, name, isFile, size) || isFile) {
+				continue;
+			}
+
+			uint64_t titleId = 0;
+			uint16_t version = 0;
+			if (parseWuaTitleFolderName(name, titleId, version)) {
+				WiiUPackagePrivate::ContainedTitle ct;
+				ct.titleId = titleId;
+				ct.version = version;
+				ct.dirName = name;
+				ct.appType = 0;
+				d->containedTitles.push_back(std::move(ct));
+
+				uint32_t tidHigh = static_cast<uint32_t>(titleId >> 32);
+				if (tidHigh == 0x00050000 || tidHigh == 0x00050002) {
+					primaryIdx = static_cast<int>(d->containedTitles.size()) - 1;
+				}
+			}
+		}
+
+		if (!d->containedTitles.empty()) {
+			if (primaryIdx < 0) {
+				primaryIdx = 0;
+			}
+			d->subPath = d->containedTitles[primaryIdx].dirName;
+		} else {
+			// Check if files are directly at root
+			if (d->zarReader->lookUp("meta/meta.xml") != ZARCHIVE_INVALID_NODE ||
+			    d->zarReader->lookUp("code/app.xml") != ZARCHIVE_INVALID_NODE)
+			{
+				d->subPath.clear();
+			} else {
+				d->reset();
+				return;
+			}
+		}
+
+		d->isValid = true;
+		return;
+	}
+#endif /* HAVE_ZSTD */
 
 	if (d->path.empty()) {
 		// No path specified...
@@ -545,8 +704,23 @@ void WiiUPackage::init(void)
  */
 int WiiUPackage::isRomSupported_static(const DetectInfo *info)
 {
+	assert(info != nullptr);
+	assert(info->header.pData != nullptr);
+	assert(info->header.addr == 0);
+	if (!info || !info->header.pData || info->header.addr != 0) {
+		return -1;
+	}
+
+#ifdef HAVE_ZSTD
+	// WUA files are ZArchive format with .wua extension.
+	if (info->ext && !strcasecmp(info->ext, ".wua")) {
+		if (info->szFile >= static_cast<off64_t>(sizeof(ZArchive_Footer))) {
+			return static_cast<int>(WiiUPackagePrivate::PackageType::WUA);
+		}
+	}
+#endif /* HAVE_ZSTD */
+
 	// Files are not supported.
-	RP_UNUSED(info);
 	return -1;
 }
 
@@ -679,6 +853,10 @@ uint32_t WiiUPackage::supportedImageTypes(void) const
 	if (d->tmd && d->tmd->tmdFormatVersion() >= 1) {
 		// Wii U packages have an icon.
 		ret = IMGBF_INT_ICON;
+	} else if (d->packageType == WiiUPackagePrivate::PackageType::Extracted ||
+	           d->packageType == WiiUPackagePrivate::PackageType::WUA) {
+		// Extracted and WUA packages have an icon.
+		ret = IMGBF_INT_ICON;
 	}
 
 #ifdef ENABLE_XML
@@ -755,9 +933,11 @@ vector<RomData::ImageSizeDef> WiiUPackage::supportedImageSizes(ImageType imageTy
 	ASSERT_supportedImageSizes(imageType);
 
 	if (imageType == IMG_INT_ICON) {
-		// IMG_INT_ICON requires a Wii U (v1) TMD.
+		// IMG_INT_ICON requires a Wii U (v1) TMD, or Extracted/WUA.
 		RP_D(const WiiUPackage);
-		if (d->tmd && d->tmd->tmdFormatVersion() >= 1) {
+		if ((d->tmd && d->tmd->tmdFormatVersion() >= 1) ||
+		    d->packageType == WiiUPackagePrivate::PackageType::Extracted ||
+		    d->packageType == WiiUPackagePrivate::PackageType::WUA) {
 			// Wii U packages have an icon.
 			return {{nullptr, 128, 128, 0}};
 		} else {
@@ -781,8 +961,8 @@ int WiiUPackage::loadFieldData(void)
 	if (!d->fields.empty()) {
 		// Field data *has* been loaded...
 		return 0;
-	} else if (d->path.empty()) {
-		// No directory...
+	} else if (d->path.empty() && !d->file) {
+		// No directory or file...
 		return -EBADF;
 	} else if (!d->isValid) {
 		// Unknown ROM image type.
@@ -813,8 +993,9 @@ int WiiUPackage::loadFieldData(void)
 			d->fields.addField_string(C_("RomData", "Warning"), err,
 				RomFields::STRF_WARNING);
 		}
-	} else if (d->packageType == WiiUPackagePrivate::PackageType::Extracted) {
-		// XML can always be loaded in extracted packages.
+	} else if (d->packageType == WiiUPackagePrivate::PackageType::Extracted ||
+	           d->packageType == WiiUPackagePrivate::PackageType::WUA) {
+		// XML can always be loaded in extracted and WUA packages.
 		canLoadXMLs = true;
 	}
 
@@ -863,6 +1044,59 @@ int WiiUPackage::loadFieldData(void)
 		}
 	}
 
+#ifdef HAVE_ZSTD
+	// If WUA contains multiple titles (e.g. Base Game + Update + DLC), list them in a separate tab.
+	if (d->containedTitles.size() > 1) {
+		d->fields.addTab(C_("WiiU", "Contained Content"));
+
+		static const array<const char*, 4> contents_names = {{
+			NOP_C_("WiiU|CtNames", "Type"),
+			NOP_C_("WiiU|CtNames", "Title ID"),
+			NOP_C_("WiiU|CtNames", "Version"),
+			NOP_C_("WiiU|CtNames", "Directory"),
+		}};
+		vector<string> *const v_contents_names = RomFields::strArrayToVector_i18n("WiiU|CtNames", contents_names);
+
+		auto *const vv_contents = new vector<vector<string>>();
+		vv_contents->reserve(d->containedTitles.size());
+		for (const auto &ct : d->containedTitles) {
+			vv_contents->emplace_back();
+			auto &data_row = vv_contents->back();
+			data_row.reserve(4);
+
+			// Type
+			const char *sType;
+			const uint32_t tidHigh = static_cast<uint32_t>(ct.titleId >> 32);
+			if (tidHigh == 0x00050000 || tidHigh == 0x00050002) {
+				sType = C_("WiiU", "Base Game");
+			} else if (tidHigh == 0x0005000E || tidHigh == 0x0005000e) {
+				sType = C_("WiiU", "Update");
+			} else if (tidHigh == 0x0005000C || tidHigh == 0x0005000c) {
+				sType = C_("WiiU", "DLC");
+			} else {
+				sType = C_("RomData", "Unknown");
+			}
+			data_row.push_back(sType);
+
+			// Title ID
+			data_row.push_back(fmt::format(FSTR("{:0>8X}-{:0>8X}"),
+				static_cast<uint32_t>(ct.titleId >> 32),
+				static_cast<uint32_t>(ct.titleId & 0xFFFFFFFFU)));
+
+			// Version
+			data_row.push_back(fmt::format(FSTR("v{:d}"), ct.version));
+
+			// Directory
+			data_row.push_back(ct.dirName);
+		}
+
+		RomFields::AFLD_PARAMS params(RomFields::RFT_LISTDATA_SEPARATE_ROW, 0);
+		params.headers = v_contents_names;
+		params.data.single = vv_contents;
+		d->fields.addField_listData(C_("WiiU", "Contained Titles"), &params);
+	}
+#endif /* HAVE_ZSTD */
+
 	// Finished reading the field data.
 	return d->fields.count();
 }
@@ -878,8 +1112,8 @@ int WiiUPackage::loadMetaData(void)
 	if (!d->metaData.empty()) {
 		// Metadata *has* been loaded...
 		return 0;
-	} else if (d->path.empty()) {
-		// No directory...
+	} else if (d->path.empty() && !d->file) {
+		// No directory or file...
 		return -EBADF;
 	} else if (!d->isValid) {
 		// Unknown ROM image type.
@@ -891,15 +1125,24 @@ int WiiUPackage::loadMetaData(void)
 	// NOTE: Adding custom properties from the ticket first, since it
 	// sets the Title to the Title ID. This will be overwritten with
 	// the actual Title if decryption is available and the XMLs are usable.
-	d->metaData.addMetaData_metaData(d->ticket->metaData());
+	if (d->ticket) {
+		d->metaData.addMetaData_metaData(d->ticket->metaData());
+	}
 
 #ifdef ENABLE_XML
-	// Check if the decryption keys were loaded.
-	const KeyManager::VerifyResult verifyResult = d->ticket->verifyResult();
-	if (verifyResult == KeyManager::VerifyResult::OK) {
-		// Decryption keys were loaded. We can add XML fields.
-		// Parse the Wii U System XMLs.
+	if (d->packageType == WiiUPackagePrivate::PackageType::Extracted ||
+	    d->packageType == WiiUPackagePrivate::PackageType::WUA)
+	{
+		// Extracted or WUA format: XML can always be loaded.
 		d->addMetaData_System_XMLs();
+	} else if (d->ticket) {
+		// Check if the decryption keys were loaded.
+		const KeyManager::VerifyResult verifyResult = d->ticket->verifyResult();
+		if (verifyResult == KeyManager::VerifyResult::OK) {
+			// Decryption keys were loaded. We can add XML fields.
+			// Parse the Wii U System XMLs.
+			d->addMetaData_System_XMLs();
+		}
 	}
 #endif /* ENABLE_XML */
 
@@ -920,7 +1163,7 @@ int WiiUPackage::loadInternalImage(ImageType imageType, rp_image_const_ptr &pIma
 	RP_D(WiiUPackage);
 	ROMDATA_loadInternalImage_single(
 		IMG_INT_ICON,	// ourImageType
-		d->path.c_str(),// file (NOTE: Using d->path because we don't have a "file")
+		(d->file ? static_cast<const void*>(d->file.get()) : static_cast<const void*>(d->path.c_str())), // file
 		d->isValid,	// isValid
 		0,		// romType
 		d->img_icon,	// imgCache
@@ -953,8 +1196,11 @@ int WiiUPackage::extURLs(ImageType imageType, vector<ExtURL> &extURLs, int size)
 	}
 
 #ifdef ENABLE_XML
-	if (d->tmd && d->tmd->tmdFormatVersion() >= 1) {
-		// This is a Wii U (v1) TMD. We can get Wii U XML files.
+	if ((d->tmd && d->tmd->tmdFormatVersion() >= 1) ||
+	    d->packageType == WiiUPackagePrivate::PackageType::Extracted ||
+	    d->packageType == WiiUPackagePrivate::PackageType::WUA)
+	{
+		// This is a Wii U (v1) TMD, Extracted, or WUA package. We can get Wii U XML files.
 
 		// Get the game ID and application type from the system XML.
 		// Format: "WUP-X-ABCD"
