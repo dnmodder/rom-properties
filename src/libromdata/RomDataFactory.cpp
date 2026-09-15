@@ -71,6 +71,9 @@ using std::unordered_set;
 #include "Console/WiiU.hpp"
 #include "Console/WiiUAncast.hpp"
 #include "Console/WiiUPackage.hpp"
+#ifdef HAVE_ZSTD
+#  include "disc/ZArchiveReader.hpp"
+#endif /* HAVE_ZSTD */
 #include "Console/WiiWAD.hpp"
 #include "Console/WiiWIBN.hpp"
 #include "Console/Xbox_XBE.hpp"
@@ -980,6 +983,19 @@ RomDataPtr create(const IRpFilePtr &file, unsigned int attrs)
 		return romData;
 	}
 
+#ifdef HAVE_ZSTD
+	// Check for a .wua file. (WiiUPackage)
+	if (info.ext != nullptr && !strcasecmp(info.ext, ".wua")) {
+		if (ZArchiveReader::isZArchive(file)) {
+			romData = std::make_shared<WiiUPackage>(file);
+			if (romData && romData->isValid()) {
+				return romData;
+			}
+			romData.reset();
+		}
+	}
+#endif /* HAVE_ZSTD */
+
 	// The actual file reader we're using.
 	// If a sparse disc image format is detected, this will be
 	// a SparseDiscReader. Otherwise, it'll be the same as `file`.
@@ -1425,6 +1441,25 @@ static void init_supportedFileExtensions(void)
 		}
 	}
 
+#ifdef HAVE_ZSTD
+	// WiiUPackage (WUA)
+	{
+		const char *const *sys_exts = WiiUPackage::romDataInfo_static()->exts;
+		if (sys_exts) {
+			for (; *sys_exts != nullptr; sys_exts++) {
+				string s_ext(*sys_exts);
+				auto iter = map_exts.find(s_ext);
+				if (iter != map_exts.end()) {
+					iter->second |= (ATTR_HAS_METADATA | ATTR_HAS_THUMBNAIL);
+				} else {
+					map_exts.emplace(std::move(s_ext), (ATTR_HAS_METADATA | ATTR_HAS_THUMBNAIL));
+					vec_exts.emplace_back(*sys_exts, (ATTR_HAS_METADATA | ATTR_HAS_THUMBNAIL));
+				}
+			}
+		}
+	}
+#endif /* HAVE_ZSTD */
+
 	// Get file extensions from FileFormatFactory.
 	const vector<const char*> &vec_exts_fileFormat = FileFormatFactory::supportedFileExtensions();
 	for (const char *ext : vec_exts_fileFormat) {
@@ -1536,6 +1571,26 @@ static void init_supportedMimeTypes(void)
 			}
 		}
 	}
+
+#ifdef HAVE_ZSTD
+	// WiiUPackage (WUA)
+	{
+		const char *const *sys_mimeTypes = WiiUPackage::romDataInfo_static()->mimeTypes;
+		if (sys_mimeTypes) {
+			for (; *sys_mimeTypes != nullptr; sys_mimeTypes++) {
+				if (!strcmp(*sys_mimeTypes, "inode/directory")) {
+					continue;
+				}
+				string s_mimeType(*sys_mimeTypes);
+				auto iter = set_mimeTypes.find(s_mimeType);
+				if (iter == set_mimeTypes.end()) {
+					set_mimeTypes.insert(std::move(s_mimeType));
+					vec_mimeTypes.push_back(*sys_mimeTypes);
+				}
+			}
+		}
+	}
+#endif /* HAVE_ZSTD */
 
 	// Get MIME types from FileFormatFactory.
 	const vector<const char*> vec_mimeTypes_fileFormat = FileFormatFactory::supportedMimeTypes();
