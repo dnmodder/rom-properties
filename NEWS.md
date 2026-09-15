@@ -1,5 +1,11 @@
 # Changes
 
+## v2.9+
+
+* New parser features:
+  * WiiUPackage: Add support for Wii U WUA (.wua) compressed archives (ZArchive format).
+    * Multi-title WUA archives with base game, updates, and DLC are detected and listed.
+
 ## v2.9 (released 2026/09/13)
 
 * New parsers:
