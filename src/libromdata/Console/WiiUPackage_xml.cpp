@@ -431,6 +431,22 @@ int WiiUPackagePrivate::addFields_System_XMLs(void)
 		if (title_version == ~0U && appRootNode) {
 			title_version = parseUnsignedInt(appRootNode, "title_version", ~0U);
 		}
+#ifdef HAVE_ZSTD
+		// If an update is present in a multi-title package (e.g. WUA), prefer the update's version
+		// to reflect the latest game version, matching Cemu's behavior.
+		int update_version = -1;
+		for (const auto &ct : this->containedTitles) {
+			const uint32_t tidHigh = static_cast<uint32_t>(ct.titleId >> 32);
+			if (tidHigh == 0x0005000E) {
+				if (static_cast<int>(ct.version) > update_version) {
+					update_version = ct.version;
+				}
+			}
+		}
+		if (update_version >= 0) {
+			title_version = static_cast<unsigned int>(update_version);
+		}
+#endif /* HAVE_ZSTD */
 		if (title_version != ~0U) {
 			fields.addField_string(C_("RomData", "Title Version"),
 				fmt::format(FSTR("{:d}.{:d} (v{:d})"),
